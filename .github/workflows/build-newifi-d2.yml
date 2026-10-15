@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Package version (leave empty for auto)'
+        description: 'Package version (e.g. 0.3.1)'
         required: false
-        default: ''
+        default: '0.3.1'
       create_release:
         description: 'Publish .apk to GitHub Releases'
         required: false
@@ -20,7 +20,6 @@ on:
       - '**.go'
       - 'go.mod'
       - 'go.sum'
-      - 'build.sh'
       - 'version.txt'
       - '.github/workflows/build-newifi-d2.yml'
 
@@ -41,7 +40,7 @@ jobs:
           go-version: 'stable'
           cache: true
 
-      - name: Install dependencies & OpenWrt 25.12 APK tool
+      - name: Install dependencies & OpenWrt APK tool
         run: |
           sudo apt-get update
           sudo apt-get install -y upx-ucl jq curl tar gzip zstd file binutils fakeroot
@@ -50,86 +49,72 @@ jobs:
           curl -fL "$IB_URL" | tar --zstd -x -C /tmp/owrt-host --strip-components=1 --wildcards '*/staging_dir/host/*'
           /tmp/owrt-host/staging_dir/host/bin/apk --version
 
-      - name: Force MIPS architecture, build and pack APK v3
+      - name: Direct Go compilation for MT7621 and APK v3 packaging
         run: |
-          chmod +x build.sh
+          # Читаем версию
+          PKG_VER="${{ github.event.inputs.version }}"
+          if [ -z "$PKG_VER" ] && [ -f version.txt ]; then
+            PKG_VER=$(cat version.txt | tr -d '[:space:]')
+          fi
+          [ -z "$PKG_VER" ] && PKG_VER="0.3.1"
+          PKG_FULL_VER="${PKG_VER}-r1"
 
-          # Полностью вырезаем из build.sh любые упоминания жесткого задания GOARCH (arm64/amd64/aarch64)
-          sed -i -E 's/GOARCH=["'\'']?(arm64|amd64|aarch64)["'\'']?/GOARCH=mipsle/g' build.sh
-          sed -i -E 's/aarch64_cortex-a53/mipsel_24kc/g' build.sh
-          sed -i -E 's/aarch64_generic/mipsel_24kc/g' build.sh
-          sed -i -E 's/aarch64/mipsel_24kc/g' build.sh
+          echo "Target version: $PKG_FULL_VER"
 
-          # Перехватываем компилятор go, чтобы гарантировать mipsle + softfloat
-          REAL_GO=$(command -v go)
-          sudo tee /usr/local/bin/go >/dev/null <<EOF
-          #!/usr/bin/env bash
+          # СТРОГАЯ КОМПИЛЯЦИЯ ГО ПОД MIPSLE SOFTFLOAT
           export CGO_ENABLED=0
           export GOOS=linux
           export GOARCH=mipsle
           export GOMIPS=softfloat
-          exec "$REAL_GO" "\$@"
-          EOF
-          sudo chmod +x /usr/local/bin/go
 
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            ./build.sh "${{ github.event.inputs.version }}"
-          else
-            ./build.sh
-          fi
-
-          # Находим созданный .ipk
-          IPK_FILE=$(ls build/*.ipk | head -n 1)
-          if [ -z "$IPK_FILE" ]; then
-            echo "ERROR: .ipk package was not generated!"
-            exit 1
-          fi
-
-          # Распаковываем для проверки и конвертации в APK v3
-          mkdir -p /tmp/pkg_extract /tmp/pkg_root /tmp/pkg_ctrl
-          if file "$IPK_FILE" | grep -qi "ar archive"; then
-            (cd /tmp/pkg_extract && ar x "$OLDPWD/$IPK_FILE")
-          else
-            tar -xzf "$IPK_FILE" -C /tmp/pkg_extract
-          fi
-          tar -xf /tmp/pkg_extract/data.tar* -C /tmp/pkg_root
-          tar -xf /tmp/pkg_extract/control.tar* -C /tmp/pkg_ctrl
-
-          # СТРОГАЯ ПРОВЕРКА: Ищем бинарник rrws и убеждаемся, что он MIPS!
-          RRWS_BIN=$(find /tmp/pkg_root -name "rrws" -type f)
-          if [ -z "$RRWS_BIN" ]; then
-            RRWS_BIN=$(find /tmp/pkg_root -type f -executable | head -n 1)
-          fi
+          echo "Compiling Go binary for linux/mipsle (GOMIPS=softfloat)..."
+          go build -ldflags="-s -w" -o rrws .
           
-          echo "Checking binary: $RRWS_BIN"
-          file "$RRWS_BIN"
-          file "$RRWS_BIN" | grep -qi "MIPS" || { echo "CRITICAL ERROR: Binary is NOT MIPS architecture!"; exit 1; }
-
-          # Извлекаем версию пакета
-          PKG_VER=$(sed -n 's/^Version:[[:space:]]*//p' /tmp/pkg_ctrl/control | tr -d '[:space:]')
-          [ -z "$PKG_VER" ] && PKG_VER="0.3.1-r1"
-          case "$PKG_VER" in
-            *-r*) ;;
-            *) PKG_VER="${PKG_VER}-r1" ;;
-          esac
-
-          # Собираем нативный APK v3
-          rm -f build/*.apk build/*.ipk
-          APK_OUT="build/luci-app-rrws_${PKG_VER}_mipsel_24kc.apk"
-
-          SCRIPT_ARGS=""
-          if [ -f /tmp/pkg_ctrl/postinst ]; then
-            SCRIPT_ARGS="--script post-install:/tmp/pkg_ctrl/postinst"
+          if command -v upx >/dev/null 2>&1; then
+            upx --best --lzma rrws || true
           fi
 
-          sudo chown -R 0:0 /tmp/pkg_root
+          # Проверка архитектуры полученного бинарника
+          file rrws
+          file rrws | grep -qi "MIPS" || { echo "CRITICAL ERROR: Compiled binary is not MIPS!"; exit 1; }
+
+          # Подготовка дерева каталогов пакета
+          mkdir -p pkg_root/usr/bin pkg_root/usr/lib/lua/luci/controller pkg_root/usr/lib/lua/luci/view pkg_root/etc/init.d pkg_root/etc/uci-defaults
+
+          cp rrws pkg_root/usr/bin/rrws
+          chmod +x pkg_root/usr/bin/rrws
+
+          # Копирование LuCI-файлов, если они есть в репозитории
+          if [ -d "root" ]; then
+            cp -r root/* pkg_root/ 2>/dev/null || true
+          fi
+          if [ -d "luci" ]; then
+            cp -r luci/* pkg_root/ 2>/dev/null || true
+          fi
+
+          # Если в корне есть стандартные папки OpenWrt (usr, etc)
+          for d in usr etc root lib; do
+            if [ -d "$d" ] && [ "$d" != "pkg_root" ]; then
+              # Копируем содержимое, кроме служебных
+              cp -rn "$d"/* pkg_root/ 2>/dev/null || true
+            fi
+          done
+
+          # Убеждаемся, что бинарник на месте и имеет верный путь
+          cp -f rrws pkg_root/usr/bin/rrws
+          chmod +x pkg_root/usr/bin/rrws
+
+          # Сборка нативного APK v3
+          mkdir -p build
+          APK_OUT="build/luci-app-rrws_${PKG_FULL_VER}_mipsel_24kc.apk"
+
+          sudo chown -R 0:0 pkg_root
           sudo /tmp/owrt-host/staging_dir/host/bin/apk mkpkg \
             --info "name:luci-app-rrws" \
-            --info "version:${PKG_VER}" \
+            --info "version:${PKG_FULL_VER}" \
             --info "arch:mipsel_24kc" \
-            --info "description:RR WARP Scanner for OpenWrt" \
-            --files /tmp/pkg_root \
-            $SCRIPT_ARGS \
+            --info "description:RR WARP Scanner for OpenWrt LuCI" \
+            --files pkg_root \
             --output "$APK_OUT"
           sudo chown "$USER:$USER" "$APK_OUT"
 
