@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Package version (e.g. 0.3.1)'
+        description: 'Package version (leave empty for auto)'
         required: false
-        default: '0.3.1'
+        default: ''
       create_release:
         description: 'Publish .apk to GitHub Releases'
         required: false
@@ -20,7 +20,7 @@ on:
       - '**.go'
       - 'go.mod'
       - 'go.sum'
-      - 'luci/**'
+      - 'build.sh'
       - 'version.txt'
       - '.github/workflows/build-newifi-d2.yml'
 
@@ -50,64 +50,72 @@ jobs:
           curl -fL "$IB_URL" | tar --zstd -x -C /tmp/owrt-host --strip-components=1 --wildcards '*/staging_dir/host/*'
           /tmp/owrt-host/staging_dir/host/bin/apk --version
 
-      - name: Build Go binary & assemble package root for MT7621
+      - name: Build via build.sh and convert IPK to native APK v3
         run: |
-          # Получаем версию пакета
-          PKG_VER="${{ github.event.inputs.version }}"
-          if [ -z "$PKG_VER" ] && [ -f version.txt ]; then
-            PKG_VER=$(cat version.txt | tr -d '[:space:]')
-          fi
-          [ -z "$PKG_VER" ] && PKG_VER="0.3.1"
-          PKG_FULL_VER="${PKG_VER}-r1"
-
-          echo "Building for version: $PKG_FULL_VER"
-
-          # 1. Компиляция Go-бинарника под mipsle (softfloat) для MT7621
+          # Перехватываем компилятор go для принудительной сборки под mipsle softfloat
+          REAL_GO=$(command -v go)
+          sudo tee /usr/local/bin/go >/dev/null <<EOF
+          #!/usr/bin/env bash
           export CGO_ENABLED=0
           export GOOS=linux
           export GOARCH=mipsle
           export GOMIPS=softfloat
+          exec "$REAL_GO" "\$@"
+          EOF
+          sudo chmod +x /usr/local/bin/go
           
-          go build -ldflags="-s -w" -o rrws-scanner .
-          if command -v upx >/dev/null 2>&1; then
-            upx --best --lzma rrws-scanner || true
-          fi
-
-          # 2. Подготовка структуры каталогов пакета OpenWrt
-          mkdir -p pkg_root/usr/bin pkg_root/usr/lib/lua/luci/controller pkg_root/usr/lib/lua/luci/view pkg_root/etc/init.d pkg_root/etc/uci-defaults
+          chmod +x build.sh
+          sed -i 's/GOARCH=arm64/GOARCH=mipsle GOMIPS=softfloat/g' build.sh || true
           
-          cp rrws-scanner pkg_root/usr/bin/rrws-scanner
-          chmod +x pkg_root/usr/bin/rrws-scanner
-
-          # Копирование файлов LuCI, если они есть в репозитории
-          if [ -d "luci" ]; then
-            cp -r luci/* pkg_root/ 2>/dev/null || true
-          # Альтернативная структура (если файлы в корне)
-          elif [ -d "root" ]; then
-            cp -r root/* pkg_root/ 2>/dev/null || true
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            ./build.sh "${{ github.event.inputs.version }}"
+          else
+            ./build.sh
           fi
 
-          # Добавляем стандартный init-скрипт и uci-defaults, если они предусмотрены проектом
-          if [ -f "init.d/rrws" ]; then
-            cp init.d/rrws pkg_root/etc/init.d/rrws
-            chmod +x pkg_root/etc/init.d/rrws
+          # Находим созданный build.sh файл .ipk
+          IPK_FILE=$(ls build/*.ipk | head -n 1)
+          if [ -z "$IPK_FILE" ]; then
+            echo "ERROR: .ipk package was not generated!"
+            exit 1
           fi
 
-          # Проверка ELF-бинарника
-          file pkg_root/usr/bin/rrws-scanner
-          file pkg_root/usr/bin/rrws-scanner | grep -qi "MIPS" || { echo "ERROR: Not MIPS binary!"; exit 1; }
+          # Распаковываем ipk для получения готовой структуры файлов проекта
+          mkdir -p /tmp/pkg_extract /tmp/pkg_root /tmp/pkg_ctrl
+          if file "$IPK_FILE" | grep -qi "ar archive"; then
+            (cd /tmp/pkg_extract && ar x "$OLDPWD/$IPK_FILE")
+          else
+            tar -xzf "$IPK_FILE" -C /tmp/pkg_extract
+          fi
+          tar -xf /tmp/pkg_extract/data.tar* -C /tmp/pkg_root
+          tar -xf /tmp/pkg_extract/control.tar* -C /tmp/pkg_ctrl
 
-          # 3. Сборка нативного APK v3 пакета
-          mkdir -p build
-          APK_OUT="build/luci-app-rrws_${PKG_FULL_VER}_mipsel_24kc.apk"
+          # Извлекаем версию пакета из управляющих файлов ipk
+          PKG_VER=$(sed -n 's/^Version:[[:space:]]*//p' /tmp/pkg_ctrl/control | tr -d '[:space:]')
+          [ -z "$PKG_VER" ] && PKG_VER="0.3.1-r1"
+          case "$PKG_VER" in
+            *-r*) ;;
+            *) PKG_VER="${PKG_VER}-r1" ;;
+          esac
+          echo "Package version for APK: $PKG_VER"
 
-          sudo chown -R 0:0 pkg_root
+          # Создаем чистый нативный APK v3 пакет для mipsel_24kc
+          rm -f build/*.apk build/*.ipk
+          APK_OUT="build/luci-app-rrws_${PKG_VER}_mipsel_24kc.apk"
+
+          SCRIPT_ARGS=""
+          if [ -f /tmp/pkg_ctrl/postinst ]; then
+            SCRIPT_ARGS="--script post-install:/tmp/pkg_ctrl/postinst"
+          fi
+
+          sudo chown -R 0:0 /tmp/pkg_root
           sudo /tmp/owrt-host/staging_dir/host/bin/apk mkpkg \
             --info "name:luci-app-rrws" \
-            --info "version:${PKG_FULL_VER}" \
+            --info "version:${PKG_VER}" \
             --info "arch:mipsel_24kc" \
             --info "description:RR WARP Scanner for OpenWrt" \
-            --files pkg_root \
+            --files /tmp/pkg_root \
+            $SCRIPT_ARGS \
             --output "$APK_OUT"
           sudo chown "$USER:$USER" "$APK_OUT"
 
