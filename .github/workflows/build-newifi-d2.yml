@@ -20,6 +20,7 @@ on:
       - '**.go'
       - 'go.mod'
       - 'go.sum'
+      - 'build.sh'
       - 'version.txt'
       - '.github/workflows/build-newifi-d2.yml'
 
@@ -49,7 +50,7 @@ jobs:
           curl -fL "$IB_URL" | tar --zstd -x -C /tmp/owrt-host --strip-components=1 --wildcards '*/staging_dir/host/*'
           /tmp/owrt-host/staging_dir/host/bin/apk --version
 
-      - name: Direct Go compilation for MT7621 and APK v3 packaging
+      - name: Compile MIPS binary, run build.sh and package APK v3
         run: |
           PKG_VER="${{ github.event.inputs.version }}"
           if [ -z "$PKG_VER" ] && [ -f version.txt ]; then
@@ -58,14 +59,12 @@ jobs:
           [ -z "$PKG_VER" ] && PKG_VER="0.3.1"
           PKG_FULL_VER="${PKG_VER}-r1"
 
-          echo "Target version: $PKG_FULL_VER"
-
+          # 1. Компилируем чистый бинарник под MIPS (softfloat)
           export CGO_ENABLED=0
           export GOOS=linux
           export GOARCH=mipsle
           export GOMIPS=softfloat
 
-          echo "Compiling Go binary for linux/mipsle (GOMIPS=softfloat)..."
           if [ -f "go.mod" ]; then
             go build -ldflags="-s -w" -o rrws .
           else
@@ -74,37 +73,69 @@ jobs:
             (cd "$MOD_DIR" && go build -ldflags="-s -w" -o "$GITHUB_WORKSPACE/rrws" .)
           fi
 
-          if command -v upx >/dev/null 2>&1; then
-            upx --best --lzma rrws || true
-          fi
-
           file rrws
           file rrws | grep -qi "MIPS" || { echo "CRITICAL ERROR: Compiled binary is not MIPS!"; exit 1; }
 
-          mkdir -p pkg_root/usr/bin pkg_root/usr/lib/lua/luci/controller pkg_root/usr/lib/lua/luci/view pkg_root/etc/init.d pkg_root/etc/uci-defaults
+          # 2. Запускаем оригинальный build.sh, чтобы он подготовил структуру и .ipk
+          chmod +x build.sh
+          ./build.sh both || ./build.sh || true
 
-          cp rrws pkg_root/usr/bin/rrws
-          chmod +x pkg_root/usr/bin/rrws
-
-          for d in usr etc root lib www luci; do
-            if [ -d "$d" ]; then
-              cp -r "$d"/* pkg_root/ 2>/dev/null || true
+          # 3. Ищем созданный .ipk или собираем структуру из исходников
+          IPK_FILE=$(ls build/*.ipk 2>/dev/null | head -n 1)
+          
+          mkdir -p /tmp/pkg_root /tmp/pkg_ctrl
+          if [ -n "$IPK_FILE" ]; then
+            mkdir -p /tmp/pkg_extract
+            if file "$IPK_FILE" | grep -qi "ar archive"; then
+              (cd /tmp/pkg_extract && ar x "$OLDPWD/$IPK_FILE")
+            else
+              tar -xzf "$IPK_FILE" -C /tmp/pkg_extract
             fi
-          done
+            tar -xf /tmp/pkg_extract/data.tar* -C /tmp/pkg_root
+            tar -xf /tmp/pkg_extract/control.tar* -C /tmp/pkg_ctrl
+          else
+            # Резервный сборщик структуры, если ipk не собрался
+            mkdir -p /tmp/pkg_root/usr/bin /tmp/pkg_root/usr/lib/lua/luci/controller /tmp/pkg_root/usr/lib/lua/luci/view /tmp/pkg_root/etc/init.d /tmp/pkg_root/etc/uci-defaults
+            for d in usr etc root lib www luci; do
+              [ -d "$d" ] && cp -r "$d"/* /tmp/pkg_root/ 2>/dev/null || true
+            done
+          fi
 
-          cp -f rrws pkg_root/usr/bin/rrws
-          chmod +x pkg_root/usr/bin/rrws
+          # 4. Подменяем бинарник внутри структуры на нашу рабочую MIPS-версию
+          find /tmp/pkg_root -name "rrws" -type f -exec cp -f rrws {} \;
+          # Если точного файла не нашлось, кладем в /usr/bin/rrws
+          mkdir -p /tmp/pkg_root/usr/bin
+          cp -f rrws /tmp/pkg_root/usr/bin/rrws
+          chmod +x /tmp/pkg_root/usr/bin/rrws
 
+          # Версия пакета
+          if [ -f /tmp/pkg_ctrl/control ]; then
+            EXT_VER=$(sed -n 's/^Version:[[:space:]]*//p' /tmp/pkg_ctrl/control | tr -d '[:space:]')
+            [ -n "$EXT_VER" ] && PKG_FULL_VER="$EXT_VER"
+          fi
+          case "$PKG_FULL_VER" in
+            *-r*) ;;
+            *) PKG_FULL_VER="${PKG_FULL_VER}-r1" ;;
+          esac
+
+          # 5. Собираем нативный APK v3
+          rm -f build/*.apk build/*.ipk
           mkdir -p build
           APK_OUT="build/luci-app-rrws_${PKG_FULL_VER}_mipsel_24kc.apk"
 
-          sudo chown -R 0:0 pkg_root
+          SCRIPT_ARGS=""
+          if [ -f /tmp/pkg_ctrl/postinst ]; then
+            SCRIPT_ARGS="--script post-install:/tmp/pkg_ctrl/postinst"
+          fi
+
+          sudo chown -R 0:0 /tmp/pkg_root
           sudo /tmp/owrt-host/staging_dir/host/bin/apk mkpkg \
             --info "name:luci-app-rrws" \
             --info "version:${PKG_FULL_VER}" \
             --info "arch:mipsel_24kc" \
             --info "description:RR WARP Scanner for OpenWrt LuCI" \
-            --files pkg_root \
+            --files /tmp/pkg_root \
+            $SCRIPT_ARGS \
             --output "$APK_OUT"
           sudo chown "$USER:$USER" "$APK_OUT"
 
