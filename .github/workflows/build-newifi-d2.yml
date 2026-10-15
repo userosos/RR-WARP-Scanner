@@ -1,0 +1,101 @@
+name: Build APK for Newifi D2 (mt7621)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Версия пакета (оставьте пустым для автоверсии из version.txt)'
+        required: false
+        default: ''
+      create_release:
+        description: 'Опубликовать пакет в GitHub Releases'
+        required: false
+        type: boolean
+        default: true
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'build.sh'
+      - 'version.txt'
+      - '.github/workflows/build-newifi-d2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    name: Build mipsel_24kc (.apk)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Install build dependencies (UPX & tools)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl jq curl tar gzip zstd python3
+
+      - name: Patch build.sh for ramips/mt7621 (mipsel_24kc + softfloat)
+        run: |
+          chmod +x build.sh
+          # Заменяем целевую архитектуру Go с arm64/amd64 на mipsle с программным FPU
+          sed -i 's/GOARCH=arm64/GOARCH=mipsle GOMIPS=softfloat/g' build.sh
+          sed -i 's/GOARCH="arm64"/GOARCH="mipsle" GOMIPS="softfloat"/g' build.sh
+          # Заменяем архитектуру пакета OpenWrt на mipsel_24kc (если задана жестко)
+          sed -i 's/aarch64_cortex-a53/mipsel_24kc/g' build.sh
+          sed -i 's/aarch64_generic/mipsel_24kc/g' build.sh
+          sed -i 's/aarch64/mipsel_24kc/g' build.sh
+
+      - name: Build packages (.ipk and .apk)
+        env:
+          CGO_ENABLED: "0"
+          GOOS: "linux"
+          GOARCH: "mipsle"
+          GOMIPS: "softfloat"
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            ./build.sh "${{ github.event.inputs.version }}" both
+          else
+            ./build.sh both
+          fi
+          ls -la build/
+
+      - name: Verify compiled binary architecture
+        run: |
+          find . -type f -executable -exec file {} + | grep -i "MIPS" || true
+
+      - name: Upload .apk and .ipk as Action Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rr-warp-scanner-mt7621-packages
+          path: |
+            build/*.apk
+            build/*.ipk
+          if-no-files-found: error
+
+      - name: Publish to GitHub Releases
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}-mt7621
+          name: "Newifi D2 (mt7621) Build #${{ github.run_number }}"
+          body: |
+            Сборка для **D-Team Newifi D2**
+            - **Целевая платформа:** `ramips/mt7621` (`mipsel_24kc`)
+            - **OpenWrt:** 25.12.x (`apk`)
+            - **Go target:** `linux/mipsle` (`GOMIPS=softfloat`)
+          files: |
+            build/*.apk
+            build/*.ipk
