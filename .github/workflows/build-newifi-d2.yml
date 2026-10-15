@@ -1,4 +1,55 @@
-- name: Direct Go compilation for MT7621 and APK v3 packaging
+name: Build APK for Newifi D2 (OpenWrt 25.12)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Package version (e.g. 0.3.1)'
+        required: false
+        default: '0.3.1'
+      create_release:
+        description: 'Publish .apk to GitHub Releases'
+        required: false
+        type: boolean
+        default: true
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'version.txt'
+      - '.github/workflows/build-newifi-d2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-apk:
+    name: Build OpenWrt 25.12 APK (mipsel_24kc)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Install dependencies & OpenWrt APK tool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y upx-ucl jq curl tar gzip zstd file binutils fakeroot
+          mkdir -p /tmp/owrt-host
+          IB_URL="https://downloads.openwrt.org/releases/25.12.5/targets/x86/64/openwrt-imagebuilder-25.12.5-x86-64.Linux-x86_64.tar.zst"
+          curl -fL "$IB_URL" | tar --zstd -x -C /tmp/owrt-host --strip-components=1 --wildcards '*/staging_dir/host/*'
+          /tmp/owrt-host/staging_dir/host/bin/apk --version
+
+      - name: Direct Go compilation for MT7621 and APK v3 packaging
         run: |
           PKG_VER="${{ github.event.inputs.version }}"
           if [ -z "$PKG_VER" ] && [ -f version.txt ]; then
@@ -15,11 +66,9 @@
           export GOMIPS=softfloat
 
           echo "Compiling Go binary for linux/mipsle (GOMIPS=softfloat)..."
-          # Компилируем из корня или ищем go.mod
           if [ -f "go.mod" ]; then
             go build -ldflags="-s -w" -o rrws .
           else
-            # Если go.mod в подпапке
             MOD_DIR=$(find . -name "go.mod" -exec dirname {} \; | head -n 1)
             [ -z "$MOD_DIR" ] && MOD_DIR="."
             (cd "$MOD_DIR" && go build -ldflags="-s -w" -o "$GITHUB_WORKSPACE/rrws" .)
@@ -61,3 +110,19 @@
 
           /tmp/owrt-host/staging_dir/host/bin/apk adbdump "$APK_OUT" | head -n 25
           ls -lh build/
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-rrws-apk-mt7621
+          path: build/*.apk
+          if-no-files-found: error
+
+      - name: Publish APK to GitHub Releases
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}-mt7621-apk
+          name: "Newifi D2 (OpenWrt 25.12 APK) Build #${{ github.run_number }}"
+          body: "OpenWrt 25.12 APK v3 package for D-Team Newifi D2 (ramips/mt7621, mipsel_24kc, GOMIPS=softfloat)"
+          files: build/*.apk
