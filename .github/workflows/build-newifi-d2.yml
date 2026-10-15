@@ -1,4 +1,4 @@
-name: Build APK for Newifi D2 (mt7621)
+name: Build APK for Newifi D2 (OpenWrt 25.12)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: false
         default: ''
       create_release:
-        description: 'Опубликовать пакет в GitHub Releases'
+        description: 'Опубликовать .apk в GitHub Releases'
         required: false
         type: boolean
         default: true
@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   build-apk:
-    name: Build mipsel_24kc (.apk)
+    name: Build OpenWrt 25.12 APK (mipsel_24kc)
     runs-on: ubuntu-latest
 
     steps:
@@ -42,60 +42,19 @@ jobs:
           go-version: 'stable'
           cache: true
 
-      - name: Install build dependencies (UPX & tools)
+      - name: Install OpenWrt 25.12.5 apk-tools (v3) and dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y upx-ucl jq curl tar gzip zstd python3
+          sudo apt-get install -y upx-ucl jq curl tar gzip zstd file fakeroot
 
-      - name: Patch build.sh for ramips/mt7621 (mipsel_24kc + softfloat)
-        run: |
-          chmod +x build.sh
-          # Заменяем целевую архитектуру Go с arm64/amd64 на mipsle с программным FPU
-          sed -i 's/GOARCH=arm64/GOARCH=mipsle GOMIPS=softfloat/g' build.sh
-          sed -i 's/GOARCH="arm64"/GOARCH="mipsle" GOMIPS="softfloat"/g' build.sh
-          # Заменяем архитектуру пакета OpenWrt на mipsel_24kc (если задана жестко)
-          sed -i 's/aarch64_cortex-a53/mipsel_24kc/g' build.sh
-          sed -i 's/aarch64_generic/mipsel_24kc/g' build.sh
-          sed -i 's/aarch64/mipsel_24kc/g' build.sh
+          # Скачиваем официальный хост-пакет apk v3 из OpenWrt 25.12.5
+          IB_URL="https://downloads.openwrt.org/releases/25.12.5/targets/ramips/mt7621/openwrt-imagebuilder-25.12.5-ramips-mt7621.Linux-x86_64.tar.zst"
+          mkdir -p /opt/owrt-host
+          curl -fL "$IB_URL" | tar --zstd -x -C /opt/owrt-host --strip-components=1 --wildcards '*/staging_dir/host/*'
 
-      - name: Build packages (.ipk and .apk)
-        env:
-          CGO_ENABLED: "0"
-          GOOS: "linux"
-          GOARCH: "mipsle"
-          GOMIPS: "softfloat"
-        run: |
-          if [ -n "${{ github.event.inputs.version }}" ]; then
-            ./build.sh "${{ github.event.inputs.version }}" both
-          else
-            ./build.sh both
-          fi
-          ls -la build/
+          # Добавляем хост-утилиты OpenWrt (включая apk) в PATH с сохранением RPATH до ../lib
+          echo "/opt/owrt-host/staging_dir/host/bin" >> $GITHUB_PATH
+          sudo ln -sf /opt/owrt-host/staging_dir/host/bin/apk /usr/local/bin/apk
+          /opt/owrt-host/staging_dir/host/bin/apk --version
 
-      - name: Verify compiled binary architecture
-        run: |
-          find . -type f -executable -exec file {} + | grep -i "MIPS" || true
-
-      - name: Upload .apk and .ipk as Action Artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: rr-warp-scanner-mt7621-packages
-          path: |
-            build/*.apk
-            build/*.ipk
-          if-no-files-found: error
-
-      - name: Publish to GitHub Releases
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release == true }}
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ github.run_number }}-mt7621
-          name: "Newifi D2 (mt7621) Build #${{ github.run_number }}"
-          body: |
-            Сборка для **D-Team Newifi D2**
-            - **Целевая платформа:** `ramips/mt7621` (`mipsel_24kc`)
-            - **OpenWrt:** 25.12.x (`apk`)
-            - **Go target:** `linux/mipsle` (`GOMIPS=softfloat`)
-          files: |
-            build/*.apk
-            build/*.ipk
+      - name: Patch build.sh for ramips/mt7621 (mipsle + softfloat)
