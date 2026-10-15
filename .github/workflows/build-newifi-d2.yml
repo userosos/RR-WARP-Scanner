@@ -50,9 +50,17 @@ jobs:
           curl -fL "$IB_URL" | tar --zstd -x -C /tmp/owrt-host --strip-components=1 --wildcards '*/staging_dir/host/*'
           /tmp/owrt-host/staging_dir/host/bin/apk --version
 
-      - name: Build via build.sh and convert IPK to native APK v3
+      - name: Force MIPS architecture, build and pack APK v3
         run: |
-          # Перехватываем компилятор go для принудительной сборки под mipsle softfloat
+          chmod +x build.sh
+
+          # Полностью вырезаем из build.sh любые упоминания жесткого задания GOARCH (arm64/amd64/aarch64)
+          sed -i -E 's/GOARCH=["'\'']?(arm64|amd64|aarch64)["'\'']?/GOARCH=mipsle/g' build.sh
+          sed -i -E 's/aarch64_cortex-a53/mipsel_24kc/g' build.sh
+          sed -i -E 's/aarch64_generic/mipsel_24kc/g' build.sh
+          sed -i -E 's/aarch64/mipsel_24kc/g' build.sh
+
+          # Перехватываем компилятор go, чтобы гарантировать mipsle + softfloat
           REAL_GO=$(command -v go)
           sudo tee /usr/local/bin/go >/dev/null <<EOF
           #!/usr/bin/env bash
@@ -63,24 +71,21 @@ jobs:
           exec "$REAL_GO" "\$@"
           EOF
           sudo chmod +x /usr/local/bin/go
-          
-          chmod +x build.sh
-          sed -i 's/GOARCH=arm64/GOARCH=mipsle GOMIPS=softfloat/g' build.sh || true
-          
+
           if [ -n "${{ github.event.inputs.version }}" ]; then
             ./build.sh "${{ github.event.inputs.version }}"
           else
             ./build.sh
           fi
 
-          # Находим созданный build.sh файл .ipk
+          # Находим созданный .ipk
           IPK_FILE=$(ls build/*.ipk | head -n 1)
           if [ -z "$IPK_FILE" ]; then
             echo "ERROR: .ipk package was not generated!"
             exit 1
           fi
 
-          # Распаковываем ipk для получения готовой структуры файлов проекта
+          # Распаковываем для проверки и конвертации в APK v3
           mkdir -p /tmp/pkg_extract /tmp/pkg_root /tmp/pkg_ctrl
           if file "$IPK_FILE" | grep -qi "ar archive"; then
             (cd /tmp/pkg_extract && ar x "$OLDPWD/$IPK_FILE")
@@ -90,16 +95,25 @@ jobs:
           tar -xf /tmp/pkg_extract/data.tar* -C /tmp/pkg_root
           tar -xf /tmp/pkg_extract/control.tar* -C /tmp/pkg_ctrl
 
-          # Извлекаем версию пакета из управляющих файлов ipk
+          # СТРОГАЯ ПРОВЕРКА: Ищем бинарник rrws и убеждаемся, что он MIPS!
+          RRWS_BIN=$(find /tmp/pkg_root -name "rrws" -type f)
+          if [ -z "$RRWS_BIN" ]; then
+            RRWS_BIN=$(find /tmp/pkg_root -type f -executable | head -n 1)
+          fi
+          
+          echo "Checking binary: $RRWS_BIN"
+          file "$RRWS_BIN"
+          file "$RRWS_BIN" | grep -qi "MIPS" || { echo "CRITICAL ERROR: Binary is NOT MIPS architecture!"; exit 1; }
+
+          # Извлекаем версию пакета
           PKG_VER=$(sed -n 's/^Version:[[:space:]]*//p' /tmp/pkg_ctrl/control | tr -d '[:space:]')
           [ -z "$PKG_VER" ] && PKG_VER="0.3.1-r1"
           case "$PKG_VER" in
             *-r*) ;;
             *) PKG_VER="${PKG_VER}-r1" ;;
           esac
-          echo "Package version for APK: $PKG_VER"
 
-          # Создаем чистый нативный APK v3 пакет для mipsel_24kc
+          # Собираем нативный APK v3
           rm -f build/*.apk build/*.ipk
           APK_OUT="build/luci-app-rrws_${PKG_VER}_mipsel_24kc.apk"
 
