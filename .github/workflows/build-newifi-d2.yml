@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Версия пакета (оставьте пустым для автоверсии из version.txt)'
+        description: 'Package version (leave empty for version.txt)'
         required: false
         default: ''
       create_release:
-        description: 'Опубликовать .apk в GitHub Releases'
+        description: 'Publish .apk to GitHub Releases'
         required: false
         type: boolean
         default: true
@@ -31,7 +31,6 @@ jobs:
   build-apk:
     name: Build OpenWrt 25.12 APK (mipsel_24kc)
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -42,19 +41,76 @@ jobs:
           go-version: 'stable'
           cache: true
 
-      - name: Install OpenWrt 25.12.5 apk-tools (v3) and dependencies
+      - name: Install dependencies and OpenWrt APK v3 tool
         run: |
           sudo apt-get update
           sudo apt-get install -y upx-ucl jq curl tar gzip zstd file fakeroot
-
-          # Скачиваем официальный хост-пакет apk v3 из OpenWrt 25.12.5
-          IB_URL="https://downloads.openwrt.org/releases/25.12.5/targets/ramips/mt7621/openwrt-imagebuilder-25.12.5-ramips-mt7621.Linux-x86_64.tar.zst"
           mkdir -p /opt/owrt-host
+          IB_URL="https://downloads.openwrt.org/releases/25.12.5/targets/ramips/mt7621/openwrt-imagebuilder-25.12.5-ramips-mt7621.Linux-x86_64.tar.zst"
+          if ! curl -fIs "$IB_URL" >/dev/null 2>&1; then
+            SNAP_BASE="https://downloads.openwrt.org/snapshots/targets/ramips/mt7621"
+            SNAP_FILE=$(curl -s "$SNAP_BASE/" | grep -oE 'openwrt-imagebuilder-[^"]+\.Linux-x86_64\.tar\.zst' | head -n 1)
+            IB_URL="$SNAP_BASE/$SNAP_FILE"
+          fi
           curl -fL "$IB_URL" | tar --zstd -x -C /opt/owrt-host --strip-components=1 --wildcards '*/staging_dir/host/*'
-
-          # Добавляем хост-утилиты OpenWrt (включая apk) в PATH с сохранением RPATH до ../lib
-          echo "/opt/owrt-host/staging_dir/host/bin" >> $GITHUB_PATH
           sudo ln -sf /opt/owrt-host/staging_dir/host/bin/apk /usr/local/bin/apk
           /opt/owrt-host/staging_dir/host/bin/apk --version
 
-      - name: Patch build.sh for ramips/mt7621 (mipsle + softfloat)
+      - name: Patch build.sh and compile APK v3 for MT7621
+        run: |
+          export CGO_ENABLED=0
+          export GOOS=linux
+          export GOARCH=mipsle
+          export GOMIPS=softfloat
+          chmod +x build.sh
+          sed -i -E 's/GOARCH=["'\'']?(arm64|amd64)["'\'']?/GOARCH=mipsle GOMIPS=softfloat/g' build.sh
+          sed -i -E 's/(aarch64_cortex-a53|aarch64_generic|aarch64)/mipsel_24kc/g' build.sh
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            PKG_VER="${{ github.event.inputs.version }}"
+            ./build.sh "$PKG_VER" both
+          else
+            ./build.sh both
+            PKG_VER=$(cat version.txt | tr -d '[:space:]')
+          fi
+          IPK_FILE=$(ls build/*.ipk | head -n 1)
+          mkdir -p /tmp/pkg_extract /tmp/pkg_root /tmp/pkg_ctrl
+          tar -xzf "$IPK_FILE" -C /tmp/pkg_extract
+          tar -xzf /tmp/pkg_extract/data.tar.gz -C /tmp/pkg_root
+          tar -xzf /tmp/pkg_extract/control.tar.gz -C /tmp/pkg_ctrl
+          BIN_FILE=$(find /tmp/pkg_root -type f -executable | head -n 1)
+          if [ -n "$BIN_FILE" ]; then
+            file "$BIN_FILE"
+            file "$BIN_FILE" | grep -qi "MIPS" || (echo "ERROR: Binary is not MIPS!" && exit 1)
+          fi
+          rm -f build/*.apk build/*.ipk
+          APK_OUT="build/luci-app-rrws_${PKG_VER}_mipsel_24kc.apk"
+          SCRIPT_ARGS=""
+          if [ -f /tmp/pkg_ctrl/postinst ]; then
+            SCRIPT_ARGS="--script post-install:/tmp/pkg_ctrl/postinst"
+          fi
+          fakeroot /opt/owrt-host/staging_dir/host/bin/apk mkpkg \
+            --info "name:luci-app-rrws" \
+            --info "version:${PKG_VER}" \
+            --info "arch:mipsel_24kc" \
+            --info "description:RR WARP Scanner for OpenWrt" \
+            --files /tmp/pkg_root \
+            $SCRIPT_ARGS \
+            --output "$APK_OUT"
+          /opt/owrt-host/staging_dir/host/bin/apk adbdump "$APK_OUT" | head -n 20
+          ls -lh build/
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: luci-app-rrws-apk-mt7621
+          path: build/*.apk
+          if-no-files-found: error
+
+      - name: Publish APK to GitHub Releases
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.create_release == true }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ github.run_number }}-mt7621-apk
+          name: "Newifi D2 (OpenWrt 25.12 APK) Build #${{ github.run_number }}"
+          body: "OpenWrt 25.12 APK v3 package for D-Team Newifi D2 (ramips/mt7621, mipsel_24kc, GOMIPS=softfloat)"
+          files: build/*.apk
